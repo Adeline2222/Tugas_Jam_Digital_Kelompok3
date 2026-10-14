@@ -1,0 +1,498 @@
+
+#include <Wire.h>
+#include <RTClib.h>
+#include <LiquidCrystal_I2C.h>
+#include <stdio.h>
+
+// 1. KONFIGURASI SISTEM
+
+// Konfigurasi LCD
+const uint8_t LCD_ADDRESS = 0x27;
+const uint8_t LCD_COLUMNS = 20;
+const uint8_t LCD_ROWS = 4;
+
+// Konfigurasi pin tombol Arduino UNO
+const uint8_t BUTTON_MENU = 2;
+const uint8_t BUTTON_UP   = 3;
+const uint8_t BUTTON_DOWN = 4;
+const uint8_t BUTTON_OK   = 5;
+
+const uint8_t BUTTON_COUNT = 4;
+const uint8_t BUTTON_PINS[BUTTON_COUNT] = {
+  BUTTON_MENU, BUTTON_UP, BUTTON_DOWN, BUTTON_OK
+};
+
+// Interval "waktu jeda" pembaruan dan pembacaan tombol
+const unsigned long LCD_UPDATE_INTERVAL = 200;
+const unsigned long DEBOUNCE_INTERVAL = 40;
+
+// Batas pengaturan tahun RTC
+const uint16_t MIN_YEAR = 2000;
+const uint16_t MAX_YEAR = 2099;
+
+// Pengaturan menu
+const uint8_t SETTING_COUNT = 6;
+const uint8_t VISIBLE_MENU_ROWS = LCD_ROWS;
+
+// Batas waktu
+const uint8_t HOURS_PER_DAY = 24;
+const uint8_t MINUTES_PER_HOUR = 60;
+const uint8_t SECONDS_PER_MINUTE = 60;
+const uint8_t MONTHS_PER_YEAR = 12;
+const uint8_t FIRST_DAY_OF_MONTH = 1;
+
+// 2. MENDAFTARKAN DAN MENGENALKAN PERANGKAT KERAS (HARDWARE) KE DALAM PROGRAM KOMPUTER.
+
+LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLUMNS, LCD_ROWS);
+RTC_DS3231 rtc;
+
+// 3. NAMA HARI
+
+const char* DAY_NAMES[] = {
+  "Minggu", "Senin", "Selasa", "Rabu",
+  "Kamis", "Jumat", "Sabtu"
+};
+
+// 4. TEMPAT MENYIMPAN DATA 
+
+struct ClockSettings {
+  uint16_t year;
+  uint8_t month;
+  uint8_t day;
+  uint8_t hour;
+  uint8_t minute;
+  uint8_t second;
+};
+
+ClockSettings draftTime;
+
+// 5. STATUS PROGRAM(penyimpanan memori (variabel) untuk mencatat status program dan tombol.)
+
+bool menuActive = false;
+uint8_t selectedSetting = 0;
+
+unsigned long lastLCDUpdate = 0;
+
+bool lastReading[BUTTON_COUNT];
+bool stableState[BUTTON_COUNT];
+unsigned long lastDebounceTime[BUTTON_COUNT];
+
+// 6. MEMBACA TOMBOL DENGAN DEBOUNCE(memastikan tombol jadi ditekan)
+
+bool buttonPressed(uint8_t buttonIndex) {
+  const bool reading = digitalRead(BUTTON_PINS[buttonIndex]);
+  const unsigned long currentMillis = millis();
+
+  if (reading != lastReading[buttonIndex]) {
+    lastReading[buttonIndex] = reading;
+    lastDebounceTime[buttonIndex] = currentMillis;
+  }
+
+  if (currentMillis - lastDebounceTime[buttonIndex]
+      >= DEBOUNCE_INTERVAL) {
+
+    if (reading != stableState[buttonIndex]) {
+      stableState[buttonIndex] = reading;
+
+      // INPUT_PULLUP menghasilkan LOW saat ditekan(Kalau tombol terbukti stabil sedang ditekan, kirim laporan 'YA, BENAR' ke program utama.")
+      if (stableState[buttonIndex] == LOW) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+// 7. MENULIS BARIS LCD
+
+void printLine(uint8_t row, const char* text) {
+  lcd.setCursor(0, row);
+
+  uint8_t index = 0;
+
+  while (index < LCD_COLUMNS && text[index] != '\0') {
+    lcd.print(text[index]);
+    index++;
+  }
+
+  // Membersihkan sisa karakter dari tampilan sebelumnya.
+  while (index < LCD_COLUMNS) {
+    lcd.print(' ');
+    index++;
+  }
+}
+
+// 8. MEMERIKSA TAHUN KABISAT
+
+bool isLeapYear(uint16_t year) {
+  const uint16_t DIVISIBLE_BY_FOUR = 4;
+  const uint16_t DIVISIBLE_BY_ONE_HUNDRED = 100;
+  const uint16_t DIVISIBLE_BY_FOUR_HUNDRED = 400;
+
+  return (year % DIVISIBLE_BY_FOUR_HUNDRED == 0)
+      || ((year % DIVISIBLE_BY_FOUR == 0)
+      && (year % DIVISIBLE_BY_ONE_HUNDRED != 0));
+}
+
+// 9. MENGHITUNG HARI DALAM BULAN
+
+uint8_t daysInMonth(uint16_t year, uint8_t month) {
+  const uint8_t monthLengths[] = {
+    31, 28, 31, 30, 31, 30,
+    31, 31, 30, 31, 30, 31
+  };
+
+  if (month == 2 && isLeapYear(year)) {
+    return 29;
+  }
+
+  return monthLengths[month - 1];
+}
+
+// 10. MENJAGA TANGGAL TETAP VALID
+
+void correctDay() {
+  const uint8_t maximumDay =
+    daysInMonth(draftTime.year, draftTime.month);
+
+  if (draftTime.day > maximumDay) {
+    draftTime.day = maximumDay;
+  }
+
+  if (draftTime.day < FIRST_DAY_OF_MONTH) {
+    draftTime.day = FIRST_DAY_OF_MONTH;
+  }
+}
+
+// 11. MEMBACA WAKTU DARI RTC
+
+void loadCurrentTime() {
+  const DateTime now = rtc.now();
+
+  draftTime.year = now.year();
+  draftTime.month = now.month();
+  draftTime.day = now.day();
+  draftTime.hour = now.hour();
+  draftTime.minute = now.minute();
+  draftTime.second = now.second();
+}
+
+// 12. MENAMPILKAN JAM UTAMA
+
+void displayClock() {
+  // RTC menjadi sumber waktu utama.
+  const DateTime now = rtc.now();
+  char line[LCD_COLUMNS + 1];
+
+  snprintf(
+    line, sizeof(line),
+    "Hari: %s",
+    DAY_NAMES[now.dayOfTheWeek()]
+  );
+  printLine(0, line);
+
+  snprintf(
+    line, sizeof(line),
+    "Jam: %02u:%02u:%02u",
+    (unsigned int)now.hour(),
+    (unsigned int)now.minute(),
+    (unsigned int)now.second()
+  );
+  printLine(1, line);
+
+  snprintf(
+    line, sizeof(line),
+    "Tgl: %02u/%02u/%04u",
+    (unsigned int)now.day(),
+    (unsigned int)now.month(),
+    (unsigned int)now.year()
+  );
+  printLine(2, line);
+
+  printLine(3, "");
+}
+
+// 13. MENAMPILKAN PILIHAN MENU
+
+void displayMenuItem(uint8_t settingIndex, uint8_t row) {
+  char line[LCD_COLUMNS + 1];
+
+  const char marker =
+    (settingIndex == selectedSetting) ? '>' : ' ';
+
+  switch (settingIndex) {
+    case 0:
+      snprintf(line, sizeof(line),
+               "%c Jam       : %02u",
+               marker, (unsigned int)draftTime.hour);
+      break;
+
+    case 1:
+      snprintf(line, sizeof(line),
+               "%c Menit     : %02u",
+               marker, (unsigned int)draftTime.minute);
+      break;
+
+    case 2:
+      snprintf(line, sizeof(line),
+               "%c Detik     : %02u",
+               marker, (unsigned int)draftTime.second);
+      break;
+
+    case 3:
+      snprintf(line, sizeof(line),
+               "%c Tanggal   : %02u",
+               marker, (unsigned int)draftTime.day);
+      break;
+
+    case 4:
+      snprintf(line, sizeof(line),
+               "%c Bulan     : %02u",
+               marker, (unsigned int)draftTime.month);
+      break;
+
+    case 5:
+      snprintf(line, sizeof(line),
+               "%c Tahun     : %04u",
+               marker, (unsigned int)draftTime.year);
+      break;
+
+    default:
+      snprintf(line, sizeof(line), "");
+      break;
+  }
+
+  printLine(row, line);
+}
+
+// 14. MENAMPILKAN MENU LCD 20x4(memanggil)
+
+void displayMenu() {
+  // Menu menampilkan maksimal empat pilihan sekaligus.
+  uint8_t firstSetting = 0;
+
+  if (selectedSetting >= VISIBLE_MENU_ROWS) {
+    firstSetting =
+      selectedSetting - VISIBLE_MENU_ROWS + 1;
+  }
+
+  for (uint8_t row = 0; row < VISIBLE_MENU_ROWS; row++) {
+    const uint8_t settingIndex = firstSetting + row;
+
+    if (settingIndex < SETTING_COUNT) {
+      displayMenuItem(settingIndex, row);
+    } else {
+      printLine(row, "");
+    }
+  }
+}
+
+// 15. MENGUBAH NILAI PENGATURAN
+
+void changeSelectedValue(int8_t direction) {
+  switch (selectedSetting) {
+
+    case 0:
+      if (direction > 0) {
+        draftTime.hour =
+          (draftTime.hour + 1) % HOURS_PER_DAY;
+      } else {
+        draftTime.hour =
+          (draftTime.hour == 0)
+          ? HOURS_PER_DAY - 1
+          : draftTime.hour - 1;
+      }
+      break;
+
+    case 1:
+      if (direction > 0) {
+        draftTime.minute =
+          (draftTime.minute + 1) % MINUTES_PER_HOUR;
+      } else {
+        draftTime.minute =
+          (draftTime.minute == 0)
+          ? MINUTES_PER_HOUR - 1
+          : draftTime.minute - 1;
+      }
+      break;
+
+    case 2:
+      if (direction > 0) {
+        draftTime.second =
+          (draftTime.second + 1) % SECONDS_PER_MINUTE;
+      } else {
+        draftTime.second =
+          (draftTime.second == 0)
+          ? SECONDS_PER_MINUTE - 1
+          : draftTime.second - 1;
+      }
+      break;
+
+    case 3: {
+      const uint8_t maximumDay =
+        daysInMonth(draftTime.year, draftTime.month);
+
+      if (direction > 0) {
+        draftTime.day =
+          (draftTime.day >= maximumDay)
+          ? FIRST_DAY_OF_MONTH
+          : draftTime.day + 1;
+      } else {
+        draftTime.day =
+          (draftTime.day <= FIRST_DAY_OF_MONTH)
+          ? maximumDay
+          : draftTime.day - 1;
+      }
+      break;
+    }
+
+    case 4:
+      if (direction > 0) {
+        draftTime.month =
+          (draftTime.month >= MONTHS_PER_YEAR)
+          ? FIRST_DAY_OF_MONTH
+          : draftTime.month + 1;
+      } else {
+        draftTime.month =
+          (draftTime.month <= FIRST_DAY_OF_MONTH)
+          ? MONTHS_PER_YEAR
+          : draftTime.month - 1;
+      }
+
+      correctDay();
+      break;
+
+    case 5:
+      if (direction > 0) {
+        draftTime.year =
+          (draftTime.year >= MAX_YEAR)
+          ? MIN_YEAR
+          : draftTime.year + 1;
+      } else {
+        draftTime.year =
+          (draftTime.year <= MIN_YEAR)
+          ? MAX_YEAR
+          : draftTime.year - 1;
+      }
+
+      correctDay();
+      break;
+  }
+}
+
+// 16. MENYIMPAN WAKTU KE RTC
+
+void saveSettings() {
+  rtc.adjust(
+    DateTime(
+      draftTime.year,
+      draftTime.month,
+      draftTime.day,
+      draftTime.hour,
+      draftTime.minute,
+      draftTime.second
+    )
+  );
+
+  menuActive = false;
+}
+
+// 17. MEMPROSES TOMBOL
+
+void handleButtons() {
+  // MENU membuka pengaturan atau berpindah pilihan.
+  if (buttonPressed(0)) {
+    if (!menuActive) {
+      loadCurrentTime();
+      selectedSetting = 0;
+      menuActive = true;
+    } else {
+      selectedSetting =
+        (selectedSetting + 1) % SETTING_COUNT;
+    }
+  }
+
+  if (!menuActive) {
+    return;
+  }
+
+  // UP menambah nilai yang dipilih.
+  if (buttonPressed(1)) {
+    changeSelectedValue(1);
+  }
+
+  // DOWN mengurangi nilai yang dipilih.
+  if (buttonPressed(2)) {
+    changeSelectedValue(-1);
+  }
+
+  // OK menyimpan waktu ke RTC.
+  if (buttonPressed(3)) {
+    saveSettings();
+  }
+}
+
+
+// 18. SETUP(Pengaturan awal)
+void setup() {
+  Wire.begin();
+
+  lcd.init();
+  lcd.backlight();
+
+  // Inisialisasi tombol menggunakan pull-up internal.
+  for (uint8_t index = 0; index < BUTTON_COUNT; index++) {
+    pinMode(BUTTON_PINS[index], INPUT_PULLUP);
+
+    lastReading[index] = digitalRead(BUTTON_PINS[index]);
+    stableState[index] = lastReading[index];
+    lastDebounceTime[index] = millis();
+  }
+
+  printLine(0, "JAM DIGITAL");
+  printLine(1, "Memulai sistem...");
+  printLine(2, "");
+  printLine(3, "");
+
+  // Periksa apakah RTC terhubung.
+  if (!rtc.begin()) {
+    printLine(0, "RTC DS3231 ERROR");
+    printLine(1, "Periksa kabel");
+    printLine(2, "SDA, SCL, VCC, GND");
+    printLine(3, "Sistem dihentikan");
+
+    while (true) {
+      // Sistem berhenti jika RTC tidak terdeteksi.
+    }
+  }
+
+  // Jika RTC kehilangan daya, gunakan waktu kompilasi.
+  if (rtc.lostPower()) {
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+
+  loadCurrentTime();
+  lastLCDUpdate = millis();
+}
+
+// 19. LOOP UTAMA
+void loop() {
+  // Membaca tombol secara terus-menerus.
+  handleButtons();
+
+  const unsigned long currentMillis = millis();
+
+  // Memperbarui LCD tanpa delay().
+  if (currentMillis - lastLCDUpdate
+      >= LCD_UPDATE_INTERVAL) {
+
+    lastLCDUpdate = currentMillis;
+
+    if (menuActive) {
+      displayMenu();
+    } else {
+      displayClock();
+    }
+  }
+}
